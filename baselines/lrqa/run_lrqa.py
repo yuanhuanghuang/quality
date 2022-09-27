@@ -1,9 +1,12 @@
 import csv
+import sys
+sys.path.append('/home/yuanhuang/quality/quality/baselines')
 import numpy as np
 import os
 import torch
 from typing import Optional
 from dataclasses import dataclass, field
+
 
 from transformers import (
     AutoConfig,
@@ -109,11 +112,14 @@ class ModelArguments:
 
 
 def main():
+
     model_args, task_args, training_args = parse_args(HfArgumentParser((
         ModelArguments,
         tasks.TaskArguments,
         TrainingArguments,
     )))
+    if not os.path.exists(training_args.output_dir):
+        os.mkdir(training_args.output_dir)
     if model_args.model_mode == "encoder-decoder":
         # Generally not good practice, but will work for now....
         training_args.__class__ = Seq2SeqTrainingArguments
@@ -179,11 +185,16 @@ def main():
         model_mode=model_args.model_mode,
     )
     if model_args.model_mode == "mc":
+        #training_args.remove_unused_columns = False
+        train_dataset = tokenized_dataset_dict.get("train")
+        train_dataset.set_format(type=train_dataset.format["type"], columns=list(train_dataset.features.keys()))
+        eval_dataset = tokenized_dataset_dict.get("validation")
+        eval_dataset.set_format(type=eval_dataset.format["type"], columns=list(eval_dataset.features.keys()))
         trainer = Trainer(
             model=model,
             args=training_args,
-            train_dataset=tokenized_dataset_dict.get("train"),
-            eval_dataset=tokenized_dataset_dict.get("validation"),
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             compute_metrics=task.compute_metrics,
             tokenizer=tokenizer,
         )
@@ -213,7 +224,9 @@ def main():
         raise KeyError(model_args.model_mode)
 
     checkpoint = last_checkpoint_handling(training_args=training_args, model_args=model_args)
+
     if training_args.do_train:
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         trainer.save_model(output_dir=os.path.join(training_args.output_dir, "checkpoint-last"))
@@ -226,6 +239,8 @@ def main():
 
     if training_args.do_eval:
         validation_metrics = trainer.evaluate(eval_dataset=tokenized_dataset_dict[model_args.eval_phase])
+        if not os.path.exists(training_args.output_dir):
+            os.mkdir(training_args.output_dir)
         write_json(validation_metrics, os.path.join(training_args.output_dir, f"{model_args.eval_phase}_metrics.json"))
         show_json(validation_metrics)
 
