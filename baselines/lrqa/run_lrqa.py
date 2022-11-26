@@ -1,17 +1,22 @@
 import csv
 import sys
-sys.path.append('/home/yuanhuang/quality/quality/baselines')
+#sys.path.append('/home/yuanhuang/quality2/quality/baselines')
+sys.path.append('/home/yuanhuang/quality_backup_nov22/quality/baselines')
 import numpy as np
 import os
 import torch
 from typing import Optional
 from dataclasses import dataclass, field
+from parallelformers import parallelize
+from utils.model_tweaks import ContextPooler
 
 
 from transformers import (
     AutoConfig,
     AutoModelForMultipleChoice,
+    AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
+    LEDForConditionalGeneration,
     AutoTokenizer,
     HfArgumentParser,
     Seq2SeqTrainer,
@@ -31,7 +36,7 @@ from lrqa.utils.model_tweaks import adjust_tokenizer
 from lrqa.utils.tokenizer_utils import get_tokenized_dataset
 from lrqa.trainers import GenerationTrainer
 from typing import Dict, List
-
+from utils.model_tweaks import DebertaV2ForMultipleChoice
 
 @dataclass
 class ModelArguments:
@@ -110,13 +115,20 @@ class ModelArguments:
         self.padding_strategy = PaddingStrategy(self.padding_strategy)
         self.truncation_strategy = TruncationStrategy(self.truncation_strategy)
 
+@dataclass
+class MyArguments:
+    input_mode: str = field(
+        default="normal",
+        metadata={"help": "concat normal"},
+    )
 
 def main():
 
-    model_args, task_args, training_args = parse_args(HfArgumentParser((
+    model_args, task_args, training_args, my_args = parse_args(HfArgumentParser((
         ModelArguments,
         tasks.TaskArguments,
         TrainingArguments,
+        MyArguments,
     )))
     if not os.path.exists(training_args.output_dir):
         os.mkdir(training_args.output_dir)
@@ -135,21 +147,80 @@ def main():
         revision=model_args.model_revision,
     )
     adjust_tokenizer(tokenizer)
+    model = None
     if model_args.model_mode == "mc":
         torch_dtype = torch.float16 if model_args.torch_dtype_fp16 else None
-        model = AutoModelForMultipleChoice.from_pretrained(
+
+        if my_args.input_mode == "concat" :
+            eos = '<eos>'
+            tokenizer.add_tokens(eos)
+            #eos_token = tokenizer(eos)['input_ids'][1]
+            if 'deberta' in model_args.model_name_or_path:
+                model = DebertaV2ForMultipleChoice.from_pretrained(
+                    model_args.model_name_or_path,
+                    from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                    config=config,
+                    cache_dir=model_args.cache_dir,
+                    revision=model_args.model_revision,
+                    torch_dtype=torch_dtype,
+                    # gradient_checkpointing=training_args.gradient_checkpointing,
+                )
+            elif 'roberta' in model_args.model_name_or_path:
+                model = DebertaV2ForMultipleChoice.from_pretrained(
+                    model_args.model_name_or_path,
+                    from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                    config=config,
+                    cache_dir=model_args.cache_dir,
+                    revision=model_args.model_revision,
+                    torch_dtype=torch_dtype,
+                    # gradient_checkpointing=training_args.gradient_checkpointing,
+                )
+
+
+        else:
+            model = AutoModelForMultipleChoice.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                torch_dtype=torch_dtype,
+                # gradient_checkpointing=training_args.gradient_checkpointing,
+            )
+            #model.ContextPooler = ContextPooler
+        #parallelize(model, num_gpus=2, fp16=True, verbose='detail')
+        if "longformer" in model_args.model_name_or_path:
+            model.config.max_global_attn = 64  # hardcode!
+    elif model_args.model_mode == 'led':
+        training_args.__class__ = Seq2SeqTrainingArguments
+        config = AutoConfig.from_pretrained(
+            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+        )
+        adjust_tokenizer(tokenizer)
+        torch_dtype = torch.float16 if model_args.torch_dtype_fp16 else None
+        model = LEDForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             torch_dtype=torch_dtype,
-            # gradient_checkpointing=training_args.gradient_checkpointing,
+            gradient_checkpointing=training_args.gradient_checkpointing,
         )
-        if "longformer" in model_args.model_name_or_path:
-            model.config.max_global_attn = 64  # hardcode!
+        model.resize_token_embeddings(len(tokenizer))
     elif model_args.model_mode == "generation":
+        model = None
+        #from utils.model_tweaks import RobertaModel
         torch_dtype = torch.float16 if model_args.torch_dtype_fp16 else None
+
         model = AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -159,7 +230,9 @@ def main():
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
         )
+
     elif model_args.model_mode == "encoder-decoder":
+        #only bert support gradient checking point
         model = T5ForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -167,11 +240,13 @@ def main():
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
         )
+
     else:
         raise KeyError(model_args.model_mode)
     if model_args.parallelize:
         model.parallelize()
     else:
+        #model.half()
         model = model.cuda()
     task = tasks.get_task(task_args=task_args)
     dataset_dict = task.get_datasets()
@@ -183,12 +258,17 @@ def main():
         padding_strategy=model_args.padding_strategy,
         truncation_strategy=model_args.truncation_strategy,
         model_mode=model_args.model_mode,
+        model_path = model_args.model_name_or_path,
     )
     if model_args.model_mode == "mc":
         #training_args.remove_unused_columns = False
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         train_dataset = tokenized_dataset_dict.get("train")
+        #train_dataset.to(device)
         train_dataset.set_format(type=train_dataset.format["type"], columns=list(train_dataset.features.keys()))
+        print()
         eval_dataset = tokenized_dataset_dict.get("validation")
+        #eval_dataset.to(device)
         eval_dataset.set_format(type=eval_dataset.format["type"], columns=list(eval_dataset.features.keys()))
         trainer = Trainer(
             model=model,
@@ -209,7 +289,7 @@ def main():
             tokenizer=tokenizer,
             data_collator=default_data_collator,
         )
-    elif model_args.model_mode == "encoder-decoder":
+    elif model_args.model_mode == "encoder-decoder" or model_args.model_mode == "led":
         training_args.remove_unused_columns = False
         trainer = Seq2SeqTrainer(
             model=model,

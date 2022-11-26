@@ -98,3 +98,18 @@ def get_option_token_pred_mask_only_correct(inputs):
         mask[i, inputs["option_token_end_idx"][i, correct_idx]-1:] = 0
     mask = mask.to(inputs["input_ids"].device)
     return mask
+
+class Trainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        #Compute loss on batch of input
+
+        labels = inputs.get("labels")
+        # forward pass
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        # compute custom loss (suppose one has 3 labels with different weights)
+        #loss_fct = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0, 3.0, 4.0]), size_average=False)
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.args.ignoreid, size_average=False)
+        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
